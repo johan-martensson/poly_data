@@ -16,6 +16,7 @@ Cursor (last block scanned) is persisted in data/cursor_state.json.
 import csv
 import json
 import os
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -145,6 +146,11 @@ def _is_rate_limited(msg: str) -> bool:
     return "429" in msg or "too many requests" in msg
 
 
+def _is_pruned_history(e: Exception) -> bool:
+    msg = str(e).lower()
+    return "-32701" in str(e) or "pruned" in msg or "history has been pruned" in msg
+
+
 def _call_with_rate_retry(fn, what: str):
     """Run an RPC call, retrying forever on HTTP 429 with exponential backoff
     capped at one minute. Other errors propagate to the caller unchanged."""
@@ -199,6 +205,14 @@ def _fetch_logs(w3, start: int, end: int):
             f"get_logs {start}-{end}",
         )
     except Exception as e:
+        if _is_pruned_history(e):
+            raise RuntimeError(
+                f"RPC node has pruned history for block {start} — it cannot serve historical logs.\n"
+                f"        Set POLYGON_RPC_URL in .env to an archival/full node, for example:\n"
+                f"          https://rpc.ankr.com/polygon          (free, archival)\n"
+                f"          https://polygon-mainnet.g.alchemy.com/v2/<key>  (Alchemy free tier)\n"
+                f"        Then re-run — the cursor resumes from block {start}."
+            ) from e
         msg = str(e).lower()
         range_err = any(
             s in msg
@@ -213,7 +227,7 @@ def _fetch_logs(w3, start: int, end: int):
         raise
 
 
-def update_chain() -> None:
+def update_chain(stop_event: threading.Event | None = None) -> None:
     if not os.path.isdir(OUTPUT_DIR):
         os.makedirs(OUTPUT_DIR)
 
@@ -243,44 +257,56 @@ def update_chain() -> None:
     total = 0
     ts_cache: dict = {}
 
-    while cur <= safe_latest:
-        end = min(cur + BLOCK_RANGE - 1, safe_latest)
-        logs = _fetch_logs(w3, cur, end)
+    def _stopped() -> bool:
+        return stop_event is not None and stop_event.is_set()
 
-        if logs:
-            rows = []
-            for log in logs:
-                row = _decode_log(log)
-                bn = row.pop("_block_number")
-                if bn not in ts_cache:
-                    ts_cache[bn] = _call_with_rate_retry(
-                        lambda b=bn: w3.eth.get_block(b), f"get_block {bn}"
-                    )["timestamp"]
-                row["timestamp"] = ts_cache[bn]
-                rows.append([row[c] for c in COLUMNS])
+    try:
+        while not _stopped() and cur <= safe_latest:
+            end = min(cur + BLOCK_RANGE - 1, safe_latest)
+            logs = _fetch_logs(w3, cur, end)
 
-            with open(OUTPUT_FILE, "a", newline="") as f:
-                csv.writer(f).writerows(rows)
-            total += len(rows)
+            if logs:
+                rows = []
+                for log in logs:
+                    row = _decode_log(log)
+                    bn = row.pop("_block_number")
+                    if bn not in ts_cache:
+                        ts_cache[bn] = _call_with_rate_retry(
+                            lambda b=bn: w3.eth.get_block(b), f"get_block {bn}"
+                        )["timestamp"]
+                    row["timestamp"] = ts_cache[bn]
+                    rows.append([row[c] for c in COLUMNS])
 
-        readable = datetime.fromtimestamp(
-            ts_cache.get(end, time.time()), tz=timezone.utc
-        ).strftime("%Y-%m-%d %H:%M:%S")
-        print(
-            f"  Blocks {cur:>10,} → {end:<10,} ({readable})  "
-            f"events: {len(logs):>4}  total: {total:,}"
-        )
+                with open(OUTPUT_FILE, "a", newline="") as f:
+                    csv.writer(f).writerows(rows)
+                total += len(rows)
 
-        cur = end + 1
-        _save_cursor(cur)
+            if end not in ts_cache:
+                ts_cache[end] = _call_with_rate_retry(
+                    lambda b=end: w3.eth.get_block(b), f"get_block {end}"
+                )["timestamp"]
+            block_time = datetime.fromtimestamp(ts_cache[end], tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            wall_time = datetime.now(tz=timezone.utc).strftime("%H:%M:%S")
+            print(
+                f"  Blocks {cur:>10,} → {end:<10,} (block: {block_time} | wall: {wall_time})  "
+                f"events: {len(logs):>4}  total: {total:,}"
+            )
 
-        # Trim cache so it doesn't grow unboundedly across a long backfill.
-        if len(ts_cache) > 50_000:
-            ts_cache.clear()
+            cur = end + 1
+            _save_cursor(cur)
 
-        time.sleep(0.05)  # be polite to free-tier RPCs
+            if len(ts_cache) > 50_000:
+                ts_cache.clear()
 
-    print(f"Done. Wrote {total:,} new rows to {OUTPUT_FILE}.")
+            time.sleep(0.05)  # be polite to free-tier RPCs
+    except KeyboardInterrupt:
+        print(f"\nStopped. Cursor saved at block {cur:,}.")
+        return
+
+    if _stopped():
+        print(f"Stopped. Cursor saved at block {cur:,}.")
+    else:
+        print(f"Done. Wrote {total:,} new rows to {OUTPUT_FILE}.")
 
 
 if __name__ == "__main__":

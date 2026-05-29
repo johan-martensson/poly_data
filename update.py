@@ -9,6 +9,8 @@ Update Polymarket v2 data:
 Both fetchers are independently resumable; subsequent runs only pull deltas.
 """
 
+import signal
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 from update_utils.update_markets import update_markets
@@ -27,12 +29,26 @@ def _run(name, fn):
 
 
 if __name__ == "__main__":
+    stop = threading.Event()
+
+    def _on_sigint(sig, frame):
+        print("\nCtrl-C received — stopping after current batch …", flush=True)
+        stop.set()
+
+    signal.signal(signal.SIGINT, _on_sigint)
+
     with ThreadPoolExecutor(max_workers=2) as ex:
         f_markets = ex.submit(_run, "markets", update_markets)
-        f_chain = ex.submit(_run, "chain", update_chain)
+        f_chain = ex.submit(_run, "chain", lambda: update_chain(stop))
         # Surface exceptions; both must succeed before processing.
-        f_markets.result()
-        f_chain.result()
+        try:
+            f_markets.result()
+            f_chain.result()
+        except Exception:
+            pass
 
-    print("\n[process] joining orders ↔ markets")
-    process_live()
+    if stop.is_set():
+        print("Interrupted — run again to resume.")
+    else:
+        print("\n[process] joining orders ↔ markets")
+        process_live()
