@@ -25,9 +25,8 @@ ORDERS_CSV = "data/orderFilled.csv"
 TRADES_CSV = "processed/trades.csv"
 
 # Chunk size for streaming the orders CSV through the join.
-# Default 0 = chunking disabled (load everything in one pass).
-# Set e.g. PROCESS_CHUNK_SIZE=500000 to bound memory on large orderFilled.csv files.
-CHUNK_SIZE = int(os.environ.get("PROCESS_CHUNK_SIZE", "0"))
+# Override with PROCESS_CHUNK_SIZE env var.
+CHUNK_SIZE = int(os.environ.get("PROCESS_CHUNK_SIZE", "500000"))
 
 
 def _processed_df(df: pl.DataFrame, markets_df: pl.DataFrame) -> pl.DataFrame:
